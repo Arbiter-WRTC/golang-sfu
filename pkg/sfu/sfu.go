@@ -94,17 +94,44 @@ func (sfu *SFU) identify() {
 	}
 }
 
+// func (sfu *SFU) listenOnSocket() {
+// 	var maxMessageSize int64 = 1024
+// 	pongWait := 60 * time.Second
+
+// 	defer func() {
+// 		sfu.socket.Close()
+// 	}()
+
+// 	sfu.socket.SetReadLimit(maxMessageSize)
+// 	sfu.socket.SetReadDeadline(time.Now().Add(pongWait))
+// 	sfu.socket.SetPongHandler(func(string) error { sfu.socket.SetReadDeadline(time.Now().Add(pongWait)); return nil })
+// 	for {
+// 		_, message, err := sfu.socket.ReadMessage()
+// 		if err != nil {
+// 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+// 				log.Printf("error: %v", err)
+// 			}
+// 			break
+// 		}
+// 		sfu.handleMessage(message)
+// 	}
+// }
+
 func (sfu *SFU) listenOnSocket() {
-	var maxMessageSize int64 = 1024
 	pongWait := 60 * time.Second
+	messageChan := make(chan []byte, 100)  // Adjust buffer size as needed
+
+	// Start a goroutine to process messages from the channel
+	go sfu.processMessages(messageChan)
 
 	defer func() {
+		close(messageChan)
 		sfu.socket.Close()
 	}()
 
-	sfu.socket.SetReadLimit(maxMessageSize)
 	sfu.socket.SetReadDeadline(time.Now().Add(pongWait))
 	sfu.socket.SetPongHandler(func(string) error { sfu.socket.SetReadDeadline(time.Now().Add(pongWait)); return nil })
+
 	for {
 		_, message, err := sfu.socket.ReadMessage()
 		if err != nil {
@@ -113,6 +140,13 @@ func (sfu *SFU) listenOnSocket() {
 			}
 			break
 		}
+
+		messageChan <- message  // Put the message in the channel
+	}
+}
+
+func (sfu *SFU) processMessages(messageChan <-chan []byte) {
+	for message := range messageChan {
 		sfu.handleMessage(message)
 	}
 }
