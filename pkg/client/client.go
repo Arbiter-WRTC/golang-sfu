@@ -1,9 +1,8 @@
 package Client
 
 import (
-	//"log"
+	"log"
 	"sync"
-	"github.com/gorilla/websocket"
 	"arbiter-go-sfu/pkg/producer" 
 	"arbiter-go-sfu/pkg/consumer"
 	"arbiter-go-sfu/pkg/arbiterTypes"
@@ -15,11 +14,11 @@ type Client struct {
 	clientId 			string
 	sfuId 				string
 	rtcConfig 		[]webrtc.ICEServer
-	socket 				*websocket.Conn
+	socket 				*ArbiterTypes.SafeConnection
 	producerTrackChannel chan ArbiterTypes.ProducerTrackChannel
 	featuresSharedChannel chan string
 	producer 			*Producer.Producer
-	consumers			*map[string] *Consumer.Consumer
+	consumers			map[string] *Consumer.Consumer
 }
 
 type HandshakePayload struct {
@@ -40,7 +39,7 @@ type IceCandidate struct {
 	SdpMLineIndex int    `json:"sdpMLineIndex"`
 }
 
-func NewClient(clientId, sfuId string, rtcConfig []webrtc.ICEServer, socket *websocket.Conn, producerTrackChannel chan ArbiterTypes.ProducerTrackChannel, featuresSharedChannel chan string) *Client {
+func NewClient(clientId, sfuId string, rtcConfig []webrtc.ICEServer, socket *ArbiterTypes.SafeConnection, producerTrackChannel chan ArbiterTypes.ProducerTrackChannel, featuresSharedChannel chan string) *Client {
 	client := &Client{
 		clientId: clientId,
 		sfuId: sfuId,
@@ -55,18 +54,27 @@ func NewClient(clientId, sfuId string, rtcConfig []webrtc.ICEServer, socket *web
 	return client
 }
 
+func (client *Client) Id() string {
+	return client.clientId
+}
+
+func (client *Client) Producer() *Producer.Producer {
+	return client.producer
+}
+
 func (client *Client) ProducerHandshake(data ArbiterTypes.HandshakePayload) {
 	client.producer.Handshake(data)
 }
 
-func (client *Client) ConsumerHandshake(remotePeerId string, data ArbiterTypes.HandshakePayload) {
+func (client *Client) ConsumerHandshake(data ArbiterTypes.HandshakePayload) {
+	remotePeerId := data.RemotePeer
 	consumer, ok := client.consumers[remotePeerId]
 
 	if !ok {
-		log.Println("error, consumer not found!", err)
+		log.Println("error, consumer not found!")
 	}
 
-	consumer.Handshake(data ArbiterTypes.HandshakePayload)
+	consumer.Handshake(data)
 }
 
 func (client *Client) GetProducerTrack(kind string) *webrtc.TrackRemote {
@@ -77,7 +85,7 @@ func (client *Client) AddConsumerTrack(remotePeerId string, track *webrtc.TrackR
 	consumer, ok := client.consumers[remotePeerId]
 
 	if !ok {
-		consumer := client.CreateConsumer(remotePeerId)
+		consumer = client.CreateConsumer(remotePeerId)
 	}
 
 	consumer.AddTrack(track)
@@ -88,18 +96,13 @@ func (client *Client) FindConsumerById(remotePeerId string) *Consumer.Consumer {
 }
 
 func (client *Client) CreateConsumer(remotePeerId string) *Consumer.Consumer {
-	consumer, err := &Consumer{
-		clientId: client.clientId,
-		sfuId: client.sfuId,
-		remotePeerId: remotePeerId,
-		rtcConfig: client.rtcConfig,
-		socket: client.socket, 
-	}
-
-	if err != nil {
-		log.Println("error creating consumer")
-		return
-	}
+	consumer := Consumer.NewConsumer(
+		client.clientId,
+		client.sfuId,
+		remotePeerId,
+		client.rtcConfig,
+		client.socket, 
+	)
 
 	client.consumers[remotePeerId] = consumer
 	return client.consumers[remotePeerId]

@@ -14,7 +14,7 @@ type Consumer struct {
 	clientId 			 		string
 	sfuId						  string
 	remotePeerId			string
-	socket					  *websocket.Conn
+	socket					  *ArbiterTypes.SafeConnection
 	connection 			  *webrtc.PeerConnection
 	rtcConfig 				[]webrtc.ICEServer
 	mediaTracks				map[string] *webrtc.TrackRemote
@@ -52,7 +52,7 @@ func NewConsumer(clientId,
 				 sfuId,
 				 remotePeerId string,
 				 rtcConfig []webrtc.ICEServer,
-				 socket *websocket.Conn,
+				 socket *ArbiterTypes.SafeConnection,
 				) *Consumer {
 
 	config := webrtc.Configuration{ICEServers: rtcConfig}
@@ -70,8 +70,6 @@ func NewConsumer(clientId,
 		connection: connection,
 	}
 	consumer.registerConnectionCallbacks()
-
-	log.Println("created a new consumer")
 	return consumer
 }
 
@@ -98,8 +96,9 @@ func (consumer *Consumer) handleIceCandidate(candidate *webrtc.ICECandidate) {
 		log.Printf("Failed to serialize JSON payload: %v\n", err)
 		return
 	}
-
-	err = consumer.socket.WriteMessage(websocket.TextMessage, payloadJSON)
+	consumer.socket.Mu.Lock()
+	defer consumer.socket.Mu.Unlock()
+	err = consumer.socket.Conn.WriteMessage(websocket.TextMessage, payloadJSON)
 	if err != nil {
 		log.Printf("Failed to send payload over WebSocket: %v\n", err)
 		return
@@ -137,57 +136,75 @@ func (consumer *Consumer) handleRTCNegotiation() {
 		return
 	}
 
-	err = consumer.socket.WriteMessage(websocket.TextMessage, payloadJSON)
+	consumer.socket.Mu.Lock()
+	defer consumer.socket.Mu.Unlock()
+	err = consumer.socket.Conn.WriteMessage(websocket.TextMessage, payloadJSON)
 	if err != nil {
 		log.Printf("Failed to send payload over WebSocket: %v\n", err)
 		return
 	}
 }
 
-func (consumer *Consumer) AddTrack(track *webrtc.TrackRemote) {
-	consumer.connection.AddTrack(track)
+func (consumer *Consumer) AddTrack(remoteTrack *webrtc.TrackRemote) {
+	localTrack, err := webrtc.NewTrackLocalStaticRTP(remoteTrack.Codec().RTPCodecCapability, remoteTrack.ID(), remoteTrack.StreamID())
+	if err != nil {
+		log.Println("error creating local track", err)
+	}
+	
+	_, trackErr := consumer.connection.AddTrack(localTrack)
+	if trackErr != nil {
+		log.Println("error adding local track to consumer", err)
+	}
+	
+	go forwardPackets(remoteTrack, localTrack)	
+}
+
+func forwardPackets(remoteTrack *webrtc.TrackRemote, consumerTrack *webrtc.TrackLocalStaticRTP) {
+	for {
+		rtpPacket, _, readErr := remoteTrack.ReadRTP()
+		if readErr != nil {
+			log.Println("error reading producer track", readErr)
+		}
+
+		writeErr := consumerTrack.WriteRTP(rtpPacket)
+		if writeErr != nil {
+			log.Println("error writing to producer track", writeErr)
+		}
+	}
 }
 
 func (consumer *Consumer) Handshake(data ArbiterTypes.HandshakePayload) {
 	if data.Description.Type.String() == "answer" {
-		log.Println("Got an SDP answer")
 		err := consumer.connection.SetRemoteDescription(data.Description)
 		if err != nil {
 			log.Println("Error setting remote description:", err)
 			return
 		}
-		log.Println("Set remote description")
 		consumer.processIceCandidates()
 	} else {
-		log.Println("Got an ICE Candidate, handling")
 		consumer.handleReceivedIceCandidate(data.Candidate)
 	}
 }
 
 func (consumer *Consumer) processIceCandidates() {
 	for _, candidate := range consumer.candidates {
-		log.Println("Adding an ice candidate")
 		err := consumer.connection.AddICECandidate(candidate)
 		if err != nil {
 			log.Println("Error adding ICE Candidate:", err)
 			return
 		}
-		log.Println("Successfully added ICE Candidate")
 	}
 }
 
 func (consumer *Consumer) handleReceivedIceCandidate(candidate webrtc.ICECandidateInit) {
 	if (consumer.connection.RemoteDescription() == nil) {
-		log.Println("Caching candidate")
 		consumer.candidates = append(consumer.candidates, candidate)
 	} else {
-		log.Println("Adding an ice candidate")
 		err := consumer.connection.AddICECandidate(candidate)
 		if err != nil {
 			log.Println("Error adding ICE Candidate:", err)
 			return
 		}
-		log.Println("Successfully added ICE Candidate")
 	}
 }
 

@@ -15,7 +15,7 @@ import (
 type SFU struct {
 	sync.RWMutex
 	clients 	    map[string]*Client.Client
-	socket        *websocket.Conn
+	socket        *ArbiterTypes.SafeConnection
 	producerTrackChannel chan ArbiterTypes.ProducerTrackChannel
 	featuresSharedChannel chan string
 	sfuId 		    string
@@ -62,17 +62,16 @@ func NewSFU(socketUrl, sfuId string, rtcConfig []webrtc.ICEServer) *SFU {
 	return sfu
 }
 
-func connectWebSocket(socketUrl string, sfuId string) (*websocket.Conn, error) {
+func connectWebSocket(socketUrl string, sfuId string) (*ArbiterTypes.SafeConnection, error) {
 	dialer := websocket.DefaultDialer
 	conn, _, err := dialer.Dial(socketUrl, nil)
 	if err != nil {
 			log.Fatal(err)
-			return nil, err
 	}
 
 	log.Println("Connected to WebSocket server:", socketUrl)
 	
-	return conn, nil
+	return &ArbiterTypes.SafeConnection{Conn: conn,}, nil
 }
 
 func (sfu *SFU) identify() {
@@ -89,49 +88,23 @@ func (sfu *SFU) identify() {
 		log.Printf("Failed to serialize JSON payload: %v\n", err)
 		return
 	}
-
-	err = sfu.socket.WriteMessage(websocket.TextMessage, payloadJSON)
+	sfu.socket.Mu.Lock()
+	defer sfu.socket.Mu.Unlock()
+	err = sfu.socket.Conn.WriteMessage(websocket.TextMessage, payloadJSON)
 	if err != nil {
 		log.Printf("Failed to send payload over WebSocket: %v\n", err)
 		return
 	}
 }
 
-// func (sfu *SFU) listenOnSocket() {
-// 	var maxMessageSize int64 = 1024
-// 	pongWait := 60 * time.Second
-
-// 	defer func() {
-// 		sfu.socket.Close()
-// 	}()
-
-// 	sfu.socket.SetReadLimit(maxMessageSize)
-// 	sfu.socket.SetReadDeadline(time.Now().Add(pongWait))
-// 	sfu.socket.SetPongHandler(func(string) error { sfu.socket.SetReadDeadline(time.Now().Add(pongWait)); return nil })
-// 	for {
-// 		_, message, err := sfu.socket.ReadMessage()
-// 		if err != nil {
-// 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-// 				log.Printf("error: %v", err)
-// 			}
-// 			break
-// 		}
-// 		sfu.handleMessage(message)
-// 	}
-// }
-
 func (sfu *SFU) listenOnSocket() {
 	pongWait := 60 * time.Second
 
-	defer func() {
-		sfu.socket.Close()
-	}()
-
-	sfu.socket.SetReadDeadline(time.Now().Add(pongWait))
-	sfu.socket.SetPongHandler(func(string) error { sfu.socket.SetReadDeadline(time.Now().Add(pongWait)); return nil })
+	sfu.socket.Conn.SetReadDeadline(time.Now().Add(pongWait))
+	sfu.socket.Conn.SetPongHandler(func(string) error { sfu.socket.Conn.SetReadDeadline(time.Now().Add(pongWait)); return nil })
 
 	for {
-		_, message, err := sfu.socket.ReadMessage()
+		_, message, err := sfu.socket.Conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				log.Printf("error: %v", err)
@@ -148,12 +121,12 @@ func (sfu *SFU) listenForEvents() {
 		select {
 		case msg := <-sfu.featuresSharedChannel:
 				fmt.Println("Feature shared event:", msg)
-		case msg := <-sfu.producerTrackChannel:
-				fmt.Println("Producer track event:", msg)
+		case data := <-sfu.producerTrackChannel:
+			log.Println("incoming producer track")
+			sfu.handleProducerTrack(data)
 		}
 	}
 }
-
 
 func (sfu *SFU) handleMessage(data []byte) {
 	var parsedData ArbiterTypes.HandshakePayload
@@ -165,21 +138,42 @@ func (sfu *SFU) handleMessage(data []byte) {
 	}
 
 	if parsedData.Type == "producer" {
-		// handle producer
-		log.Println("Handing producer message")
 		sfu.handleProducerHandshake(parsedData)
 	} else if parsedData.Type == "consumer" {
-		// handle consumer
+		sfu.handleConsumerHandshake(parsedData)
 	}
 }
 
-// HandleProducerHandshake
-// 	Get the sender attribute
-//  Find client by sender attribute
-//  If Client doesn't exist
-//     Create client
-//  Call ProducerHandshake on Client
+func (sfu *SFU) handleProducerTrack(data ArbiterTypes.ProducerTrackChannel) {
+	// Id, Track
+	for _, client := range sfu.clients {
+		clientId := client.Id()
+		if clientId == data.Id {
+			sfu.consumerCatchup(clientId)
+			continue
+		}
+		log.Println("attempting to add a track of type", data.Track.Kind())
+		log.Println("the track is from", clientId)
+		log.Println("the new producer is", data.Id)
+		client.AddConsumerTrack(clientId, data.Track)
+	}
+}
+
+func (sfu *SFU) consumerCatchup(catchupClientId string) {
+	catchupClient := sfu.findClientById(catchupClientId)
+	for _, client := range sfu.clients {
+		clientId := client.Id()
+		if clientId == catchupClientId {
+			continue
+		}
+		for _, track := range client.Producer().GetMediaTracks() {
+			catchupClient.AddConsumerTrack(catchupClientId, track)
+		}
+	}
+}
+
 func (sfu *SFU) handleProducerHandshake(data ArbiterTypes.HandshakePayload) {
+	
 	sender := data.Sender
 	client := sfu.findClientById(sender)
 
@@ -187,106 +181,28 @@ func (sfu *SFU) handleProducerHandshake(data ArbiterTypes.HandshakePayload) {
 		log.Println("Adding a new client")
 		client = sfu.addClient(sender)
 	}
+	// how do we know if its a producer or consumer
 	client.ProducerHandshake(data);
 }
 
+func (sfu *SFU) handleConsumerHandshake(data ArbiterTypes.HandshakePayload) {
+	sender := data.Sender
+	client := sfu.findClientById(sender)
+	if client != nil {
+		client.ConsumerHandshake(data)
+	}
+}
+
 func (sfu *SFU) findClientById(clientId string) *Client.Client {
-	log.Println("the id is:", clientId)
 	client, ok := sfu.clients[clientId]
 	if ok {
-		log.Println("Found client, returning")
 		return client
 	}
-	log.Println("No client found, returning nil")
 	return nil
 }
 
 func (sfu *SFU) addClient(clientId string) *Client.Client {
-	client := Client.NewClient(clientId, sfu.sfuId, sfu.rtcConfig, sfu.socket,sfu.producerTrackChannel, sfu.featuresSharedChannel)
+	client := Client.NewClient(clientId, sfu.sfuId, sfu.rtcConfig, sfu.socket ,sfu.producerTrackChannel, sfu.featuresSharedChannel)
 	sfu.clients[clientId] = client
 	return client
 }
-
-// func (sfu *SFU) findClientById()
-
-
-// func handleConnect(sfuId string) {
-// 	log.Println("Connected to WebSocket Server:")
-
-// 	payload := IdentifyPayload{
-// 		Action: "identify",
-// 		Data: struct {
-// 			ID   string `json:"id"`
-// 			Type string `json:"type`
-// 		}{
-// 			ID: sfuId,
-// 			Type: "sfu",
-// 		},
-// 	}
-
-// 	payloadJSON, err := json.Marshal(payload)
-// 	if err != nil {
-// 		log.Printf("Failed to serialize JSON payload: %v\n", err)
-// 		return
-// 	}
-
-// 	err = sfu.socket.WriteMessage(websocket.TextMessage, payloadJSON)
-// 	if err != nil {
-// 		log.Printf("Failed to send payload over WebSocket: %v\n", err)
-// 		return
-// 	}
-
-// 	log.Printf("Identifying... %s\n", sfuId)
-// }
-
-// // These methods would need proper implementation in Go
-// func (sfu *SFU) bindClientEvents() {
-// 	// ... Bind client events ...
-// }
-
-// func (sfu *SFU) handleFeaturesShared(id string, features interface{}, initialConnect bool) {
-// 	// ... Handle shared features ...
-// }
-
-// func (sfu *SFU) featuresCatchup(catchupClientId string) {
-// 	// ... Implement features catchup logic ...
-// }
-
-// func (sfu *SFU) handleProducerTrack(id string, track interface{}) {
-// 	// ... Handle producer track ...
-// }
-
-// func (sfu *SFU) consumerCatchup(catchupClientId string) {
-// 	// ... Implement consumer catchup logic ...
-// }
-
-// func (sfu *SFU) bindSocketEvents() {
-// 	// ... Bind socket events ...
-// }
-
-// func (sfu *SFU) handleConnect() {
-// 	fmt.Println("Connected to websocket server")
-// 	// sfu.socket.emit would emit events on the socket
-// }
-
-// func (sfu *SFU) handleProducerHandshake(clientId string, description interface{}, candidate interface{}) {
-// 	// ... Handle producer handshake ...
-// }
-
-// func (sfu *SFU) handleConsumerHandshake(clientId string, remotePeerId string, description interface{}, candidate interface{}) {
-// 	// ... Handle consumer handshake ...
-// }
-
-// func (sfu *SFU) handleClientDisconnect(clientId string) {
-// 	// ... Handle client disconnect ...
-// }
-
-// func (sfu *SFU) addClient(id string) *Client {
-// 	// ... Add a new client ...
-// 	return &Client{} // Return a reference to the new client
-// }
-
-// func (sfu *SFU) findClientById(id string) *Client {
-// 	// ... Find client by ID ...
-// 	return &Client{} // Return a reference to the found client
-// }

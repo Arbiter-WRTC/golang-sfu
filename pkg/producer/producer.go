@@ -13,7 +13,7 @@ type Producer struct {
 	sync.RWMutex
 	clientId 			 		string
 	sfuId						  string
-	socket					  *websocket.Conn
+	socket					  *ArbiterTypes.SafeConnection
 	producerTrackChannel chan ArbiterTypes.ProducerTrackChannel
 	featuresSharedChannel chan string
 	isNegotiating		 	bool
@@ -50,7 +50,7 @@ type IcePayload struct {
 func NewProducer(clientId,
 				 sfuId string,
 				 rtcConfig []webrtc.ICEServer,
-				 socket *websocket.Conn,
+				 socket *ArbiterTypes.SafeConnection,
 				 producerTrackChannel chan ArbiterTypes.ProducerTrackChannel,
 				 featuresSharedChannel chan string) *Producer {
 
@@ -71,7 +71,6 @@ func NewProducer(clientId,
 	}
 	producer.registerConnectionCallbacks()
 
-	log.Println("created a new producer")
 	return producer
 }
 
@@ -81,7 +80,6 @@ func (producer *Producer) registerConnectionCallbacks() {
 }
 
 func (producer *Producer) handleIceCandidate(candidate *webrtc.ICECandidate) {
-	log.Println("Got an ICE candidate:", candidate);
 	payload := IceMessage {
 		Action: "handshake",
 		Data: IcePayload {
@@ -98,7 +96,9 @@ func (producer *Producer) handleIceCandidate(candidate *webrtc.ICECandidate) {
 		return
 	}
 
-	err = producer.socket.WriteMessage(websocket.TextMessage, payloadJSON)
+	producer.socket.Mu.Lock()
+	defer producer.socket.Mu.Unlock()
+	err = producer.socket.Conn.WriteMessage(websocket.TextMessage, payloadJSON)
 	if err != nil {
 		log.Printf("Failed to send payload over WebSocket: %v\n", err)
 		return
@@ -118,14 +118,12 @@ func (producer *Producer) GetMediaTracks() map[string] *webrtc.TrackRemote {
 
 func (producer *Producer) Handshake(data ArbiterTypes.HandshakePayload) {
 	if data.Description.Type.String() == "offer" {
-		log.Println("Got an SDP")
 		err := producer.connection.SetRemoteDescription(data.Description)
 		if err != nil {
 			log.Println("Error setting remote description:", err)
 			return
 		}
 		log.Println("Set remote description")
-
 		options := webrtc.OfferAnswerOptions{
 			VoiceActivityDetection: false,
 		}
@@ -160,15 +158,15 @@ func (producer *Producer) Handshake(data ArbiterTypes.HandshakePayload) {
 			return
 		}
 
-		err = producer.socket.WriteMessage(websocket.TextMessage, payloadJSON)
+		producer.socket.Mu.Lock()
+		defer producer.socket.Mu.Unlock()
+		err = producer.socket.Conn.WriteMessage(websocket.TextMessage, payloadJSON)
 		if err != nil {
 			log.Printf("Failed to send payload over WebSocket: %v\n", err)
 			return
 		}
-		log.Println("i'm just chillin")
 		producer.processIceCandidates()
 	} else {
-		log.Println("Got an ICE Candidate, handling")
 		producer.handleReceivedIceCandidate(data.Candidate)
 	}
 	// if data.Description != nil {
@@ -178,34 +176,27 @@ func (producer *Producer) Handshake(data ArbiterTypes.HandshakePayload) {
 
 func (producer *Producer) handleReceivedIceCandidate(candidate webrtc.ICECandidateInit) {
 	if (producer.connection.RemoteDescription() == nil) {
-		log.Println("Caching candidate")
 		producer.candidates = append(producer.candidates, candidate)
 	} else {
-		log.Println("Adding an ice candidate")
 		err := producer.connection.AddICECandidate(candidate)
 		if err != nil {
 			log.Println("Error adding ICE Candidate:", err)
 			return
 		}
-		log.Println("Successfully added ICE Candidate")
 	}
 }
 
 func (producer *Producer) processIceCandidates() {
 	for _, candidate := range producer.candidates {
-		log.Println("Adding an ice candidate")
 		err := producer.connection.AddICECandidate(candidate)
 		if err != nil {
 			log.Println("Error adding ICE Candidate:", err)
 			return
 		}
-		log.Println("Successfully added ICE Candidate")
 	}
 }
 
 func (producer *Producer) AddChatChannel() {
-	log.Println("Trying to add a chat channel")
-
 	negotiated := true
 	options := webrtc.DataChannelInit{
 		Negotiated: &negotiated,
