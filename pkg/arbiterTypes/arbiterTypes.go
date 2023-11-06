@@ -10,3 +10,8 @@ type HandshakePayload struct {
 	Description webrtc.SessionDescription `json:"description,omitempty"`
 	Candidate webrtc.ICECandidateInit `json:"candidate,omitempty"`
 }
+
+type ProducerTrackChannel struct {
+	Id string `json:"id"`
+	Track *webrtc.TrackRemote `json:"track"`
+}

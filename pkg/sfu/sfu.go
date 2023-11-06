@@ -15,14 +15,15 @@ import (
 type SFU struct {
 	sync.RWMutex
 	clients 	    map[string]*Client.Client
-	socket          *websocket.Conn
-	eventEmitter    map[string]chan string
+	socket        *websocket.Conn
+	producerTrackChannel chan ArbiterTypes.ProducerTrackChannel
+	featuresSharedChannel chan string
 	sfuId 		    string
-	rtcConfig       []webrtc.ICEServer
+	rtcConfig     []webrtc.ICEServer
 }
 
 type IdentifyMessage struct {
-    Action string `json:"action"`
+    Action string 				 `json:"action"`
     Data   IdentifyPayload `json:"data"`	
 }
 
@@ -39,18 +40,20 @@ func NewSFU(socketUrl, sfuId string, rtcConfig []webrtc.ICEServer) *SFU {
 		// return
 	}
 
-	eventEmitter := make(map[string] chan string)
-	eventEmitter["featuresShared"] = make(chan string)
-	eventEmitter["producerTrack"] = make(chan string)
+	featuresSharedChannel := make(chan string)
+	producerTrackChannel := make(chan ArbiterTypes.ProducerTrackChannel)
 	
 	sfu := &SFU{
 		clients: make(map[string]*Client.Client),
 		socket: socket,
-		eventEmitter: eventEmitter,
+		featuresSharedChannel: featuresSharedChannel,
+		producerTrackChannel: producerTrackChannel,
 		sfuId: sfuId,
 		rtcConfig: rtcConfig,
 	}
 	
+	// starts a goroutine to listen to events that will occur in producer structs that need to be acted on
+	// by other clients
 	go sfu.listenForEvents()
 	// identify sends a signal to the websocket server that tells it who it is, so it can be stored in the db
 	sfu.identify()
@@ -74,12 +77,12 @@ func connectWebSocket(socketUrl string, sfuId string) (*websocket.Conn, error) {
 
 func (sfu *SFU) identify() {
 	payload := IdentifyMessage {
-        Action: "identify",
-        Data: IdentifyPayload {
-            ID:   sfu.sfuId,
-            Type: "sfu",
-        },
-    }
+							Action: "identify",
+							Data: IdentifyPayload {
+								ID:   sfu.sfuId,
+								Type: "sfu",
+							},
+    				}
 
 	payloadJSON, err := json.Marshal(payload)
 	if err != nil {
@@ -119,13 +122,8 @@ func (sfu *SFU) identify() {
 
 func (sfu *SFU) listenOnSocket() {
 	pongWait := 60 * time.Second
-	messageChan := make(chan []byte, 100)  // Adjust buffer size as needed
-
-	// Start a goroutine to process messages from the channel
-	go sfu.processMessages(messageChan)
 
 	defer func() {
-		close(messageChan)
 		sfu.socket.Close()
 	}()
 
@@ -140,24 +138,18 @@ func (sfu *SFU) listenOnSocket() {
 			}
 			break
 		}
-
-		messageChan <- message  // Put the message in the channel
-	}
-}
-
-func (sfu *SFU) processMessages(messageChan <-chan []byte) {
-	for message := range messageChan {
-		sfu.handleMessage(message)
+		// Start a goroutine to process messages from the channel
+		go sfu.handleMessage(message)
 	}
 }
 
 func (sfu *SFU) listenForEvents() {
 	for {
 		select {
-		case msg := <-sfu.eventEmitter["featuresShared"]:
-				fmt.Println(msg)
-		case msg := <-sfu.eventEmitter["producerTrack"]:
-				fmt.Println(msg)
+		case msg := <-sfu.featuresSharedChannel:
+				fmt.Println("Feature shared event:", msg)
+		case msg := <-sfu.producerTrackChannel:
+				fmt.Println("Producer track event:", msg)
 		}
 	}
 }
@@ -165,15 +157,12 @@ func (sfu *SFU) listenForEvents() {
 
 func (sfu *SFU) handleMessage(data []byte) {
 	var parsedData ArbiterTypes.HandshakePayload
-	log.Println("unparsed: ", string(data))
 	// check if its a sdp or an ice candidate
 	// if it's an ice candidate, we need to marshal it better
 	if err := json.Unmarshal(data, &parsedData); err != nil {
 		log.Printf("Failed to parse JSON payload: %v\n", err)
 		return
 	}
-
-	log.Println("parsed: ", parsedData)
 
 	if parsedData.Type == "producer" {
 		// handle producer
@@ -195,7 +184,6 @@ func (sfu *SFU) handleProducerHandshake(data ArbiterTypes.HandshakePayload) {
 	client := sfu.findClientById(sender)
 
 	if client == nil {
-		// create a new client
 		log.Println("Adding a new client")
 		client = sfu.addClient(sender)
 	}
@@ -214,7 +202,7 @@ func (sfu *SFU) findClientById(clientId string) *Client.Client {
 }
 
 func (sfu *SFU) addClient(clientId string) *Client.Client {
-	client := Client.NewClient(clientId, sfu.rtcConfig, sfu.socket,sfu.eventEmitter)
+	client := Client.NewClient(clientId, sfu.sfuId, sfu.rtcConfig, sfu.socket,sfu.producerTrackChannel, sfu.featuresSharedChannel)
 	sfu.clients[clientId] = client
 	return client
 }
